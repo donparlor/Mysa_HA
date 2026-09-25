@@ -494,6 +494,9 @@ class MysaRealtime:
 
         if msg_type == 30 and body or body:
             update = self._extract_body_state(body) or {}
+        elif msg_type == 0:
+            # Legacy telemetry carries measurements at the root, without a body.
+            update = payload.copy()
 
         # Timestamp and metadata
         if msg_ts:
