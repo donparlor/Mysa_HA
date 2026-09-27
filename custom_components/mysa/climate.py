@@ -47,6 +47,11 @@ from .const import (
     AC_KEY_FAN_HIGH,
     AC_KEY_FAN_LOW,
     AC_KEY_FAN_MEDIUM,
+    AC_KEY_MODE_AUTO,
+    AC_KEY_MODE_COOL,
+    AC_KEY_MODE_DRY,
+    AC_KEY_MODE_FAN,
+    AC_KEY_MODE_HEAT,
     AC_KEY_SWING_V_ON,
     AC_MODE_AUTO,
     AC_MODE_COOL,
@@ -605,8 +610,28 @@ class MysaACClimate(MysaClimate):
                 mode_int = int(mode_key)
                 if mode_int in mode_mapping:
                     self._supported_hvac_modes.append(mode_mapping[mode_int])
-            except ValueError:
+            except (ValueError, TypeError):
                 pass
+
+        # Some AC-V1 responses omit SupportedCaps.modes but still expose the
+        # remote-control KeyIDs. These KeyIDs are command capabilities, not the
+        # values used in the MQTT `md` field (notably KeyID 5 means Dry while
+        # `md=6` means Dry).
+        if not modes:
+            key_mode_mapping = {
+                AC_KEY_MODE_AUTO: HVACMode.HEAT_COOL,
+                AC_KEY_MODE_COOL: HVACMode.COOL,
+                AC_KEY_MODE_DRY: HVACMode.DRY,
+                AC_KEY_MODE_FAN: HVACMode.FAN_ONLY,
+                AC_KEY_MODE_HEAT: HVACMode.HEAT,
+            }
+            for key in self._supported_caps.get("keys", []):
+                try:
+                    mode = key_mode_mapping.get(int(key))
+                except (ValueError, TypeError):
+                    mode = None
+                if mode is not None and mode not in self._supported_hvac_modes:
+                    self._supported_hvac_modes.append(mode)
 
     def _build_fan_modes(self, modes: dict[str, Any]) -> None:
         """Aggregate fan speeds from all available mode's capabilities."""
