@@ -4,6 +4,7 @@ import asyncio
 import base64
 import json
 import logging
+import struct
 import time
 from collections.abc import Callable
 from typing import Any, cast
@@ -50,6 +51,8 @@ class MysaRealtime:
         self._mqtt_listener_task: asyncio.Task[None] | None = None
         self._mqtt_connected = asyncio.Event()
         self._mqtt_ws: Any = None  # ws object from `connect_websocket`
+        self._last_publish_id = 0
+        self._pending_publish_ids: set[int] = set()
         self._mqtt_should_reconnect = True
         self._mqtt_reconnect_delay = 1.0
         self._devices_ids: list[str] = []  # List of device IDs to subscribe to
@@ -205,6 +208,8 @@ class MysaRealtime:
         # Connect
         ws = await connect_websocket(signed_url)
         self._mqtt_ws = ws
+        # CONNECT uses a clean session, so old in-flight publishes are gone.
+        self._pending_publish_ids.clear()
 
         try:
             await self._perform_mqtt_handshake(ws)
@@ -331,6 +336,21 @@ class MysaRealtime:
                         )
             _LOGGER.debug("Subscribed to %d device topics", len(self._devices_ids))
 
+    async def _dispatch_mqtt_packet(self, ws: Any, pkt: Any) -> None:
+        """Route one decoded packet, acknowledging QoS 1 deliveries."""
+        if isinstance(pkt, mqtt.PublishPacket):
+            # Actual device telemetry: refresh the data watchdog.
+            self._last_data_time = time.time()
+            if pkt.qos == 1 and pkt.packetid is not None:
+                # MQTT 3.1.1 section 4.3.2: a QoS 1 delivery must be
+                # acknowledged, or the broker keeps redelivering it.
+                await ws.send(struct.pack("!BBH", 0x40, 2, pkt.packetid))
+            await self._process_mqtt_publish(pkt)
+        elif isinstance(pkt, mqtt.PubackPacket):
+            self._pending_publish_ids.discard(pkt.packet_id)
+        elif hasattr(pkt, "pkt_type") and pkt.pkt_type == mqtt.MQTT_PACKET_PINGRESP:
+            _LOGGER.debug("Received PINGRESP")
+
     async def _run_mqtt_loop(self, ws: Any) -> None:
         """Run the main MQTT message and keepalive loop."""
         last_ping = time.time()
@@ -349,15 +369,7 @@ class MysaRealtime:
                 try:
                     pkt = parse_mqtt_packet(msg)
                     if pkt:
-                        if isinstance(pkt, mqtt.PublishPacket):
-                            # Actual device telemetry: refresh the data watchdog.
-                            self._last_data_time = time.time()
-                            await self._process_mqtt_publish(pkt)
-                        elif (
-                            hasattr(pkt, "pkt_type")
-                            and pkt.pkt_type == mqtt.MQTT_PACKET_PINGRESP
-                        ):
-                            _LOGGER.debug("Received PINGRESP")
+                        await self._dispatch_mqtt_packet(ws, pkt)
                 except Exception as parse_error:
                     _LOGGER.warning(
                         "Error parsing MQTT packet: %s", parse_error, exc_info=True
@@ -513,6 +525,9 @@ class MysaRealtime:
 
         if msg_type == 30 and body or body:
             update = self._extract_body_state(body) or {}
+        elif msg_type == 0:
+            # Legacy telemetry carries measurements at the root, without a body.
+            update = payload.copy()
 
         # Timestamp and metadata
         if msg_ts:
@@ -681,6 +696,15 @@ class MysaRealtime:
         # Fallback: if no state/cmd, use body itself
         return cast(dict[str, Any], body)
 
+    def _allocate_publish_id(self) -> int:
+        """Reserve a nonzero identifier until the broker acknowledges it."""
+        for _ in range(65535):
+            self._last_publish_id = self._last_publish_id % 65535 + 1
+            if self._last_publish_id not in self._pending_publish_ids:
+                self._pending_publish_ids.add(self._last_publish_id)
+                return self._last_publish_id
+        raise RuntimeError("No free MQTT packet identifiers")
+
     # Justification: Complex signature required to form varied command payloads and types.
     async def send_command(  # pylint: disable=too-many-locals
         self,
@@ -731,7 +755,12 @@ class MysaRealtime:
                 # 2. Publish
                 # Note: We use QoS 1 for commands to ensure delivery
                 pub_pkt = mqtt.publish(
-                    topic, False, 1, False, packet_id=7, payload=json_payload.encode()
+                    topic,
+                    False,
+                    1,
+                    False,
+                    packet_id=self._allocate_publish_id(),
+                    payload=json_payload.encode(),
                 )
                 await self._mqtt_ws.send(pub_pkt)
                 return  # Success
@@ -770,7 +799,12 @@ class MysaRealtime:
         try:
             # QoS 1 for control messages
             pub_pkt = mqtt.publish(
-                topic, False, 1, False, packet_id=10, payload=json_payload.encode()
+                topic,
+                False,
+                1,
+                False,
+                packet_id=self._allocate_publish_id(),
+                payload=json_payload.encode(),
             )
             await self._mqtt_ws.send(pub_pkt)
             _LOGGER.debug("Published to %s: %s", topic, json_payload)
