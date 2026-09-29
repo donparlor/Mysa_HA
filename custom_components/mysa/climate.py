@@ -713,7 +713,20 @@ class MysaACClimate(MysaClimate):
         if not state:
             return HVACMode.OFF
 
-        # Get mode from TstatMode or ACMode
+        # AC-V1 HTTP/cache mode aliases can be stale at startup or after an
+        # MQTT reconnect. Do not expose them until the current MQTT connection
+        # has supplied an actual HVAC mode.
+        model = str(self._device_data.get("Model", "")).upper()
+        if model.startswith("AC-V1") and not self._api.has_fresh_mqtt_hvac_state(
+            self._device_id
+        ):
+            _LOGGER.debug(
+                "AC %s: waiting for fresh MQTT HVAC mode before exposing state",
+                self._device_id,
+            )
+            return None
+
+        # Once MQTT freshness is established, retain the normal fallbacks.
         mode_id = self._extract_value(
             state, ["md", "mode", "TstatMode", "ACMode", "Mode"]
         )

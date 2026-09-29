@@ -4375,3 +4375,85 @@ class TestClimateConsolidated:
                      # Fallback line 1266
                      mock_cur.return_value = 22.0
                      assert climate.hvac_action == HVACAction.HEATING
+
+@pytest.mark.asyncio
+async def test_ac_v1_hvac_mode_waits_for_fresh_mqtt_state(hass):
+    """AC-V1 must not expose stale cached HVAC mode before fresh MQTT telemetry."""
+    from custom_components.mysa.climate import MysaACClimate
+
+    coordinator = MagicMock()
+    coordinator.data = {
+        "ac_device": {
+            # Simulate stale HTTP/cache data claiming COOL.
+            "ACMode": 4,
+            "Mode": 4,
+            "ambTemp": 21.0,
+            "stpt": 20.0,
+        }
+    }
+
+    api = MagicMock()
+    api.has_fresh_mqtt_hvac_state.return_value = False
+
+    entry = MagicMock()
+    entry.entry_id = "test_entry"
+
+    device_data = {
+        "Id": "ac_device",
+        "Name": "Test AC",
+        "Model": "AC-V1-0",
+        "SupportedCaps": {"modes": {"4": {}, "5": {}}},
+    }
+
+    entity = MysaACClimate(
+        coordinator,
+        "ac_device",
+        device_data,
+        api,
+        entry,
+    )
+    entity.hass = hass
+    entity.entity_id = "climate.test_ac"
+
+    # Stale HTTP/cache COOL must not be exposed.
+    assert entity.hvac_mode is None
+
+    # Fresh MQTT telemetry arrives in the current connection.
+    coordinator.data["ac_device"]["md"] = 6
+    api.has_fresh_mqtt_hvac_state.return_value = True
+
+    assert entity.hvac_mode == HVACMode.DRY
+
+def test_ac_hvac_modes_fallback_to_key_ids():
+    """AC-V1 discovers HVAC modes from KeyIDs when SupportedCaps.modes is empty."""
+    from custom_components.mysa.climate import MysaACClimate
+
+    coordinator = MagicMock()
+    api = MagicMock()
+    entry = MagicMock()
+
+    device_data = {
+        "Id": "ac_keyid_device",
+        "Name": "AC KeyID Test",
+        "Model": "AC-V1-0",
+        "SupportedCaps": {
+            "modes": {},
+            # 3=Auto, 4=Cool, 5=Dry, 6=Fan, 7=Heat.
+            # Include an invalid value to exercise defensive parsing.
+            "keys": [3, 4, 5, 6, 7, "invalid"],
+        },
+    }
+
+    entity = MysaACClimate(
+        coordinator,
+        "ac_keyid_device",
+        device_data,
+        api,
+        entry,
+    )
+
+    assert HVACMode.HEAT_COOL in entity.hvac_modes
+    assert HVACMode.COOL in entity.hvac_modes
+    assert HVACMode.DRY in entity.hvac_modes
+    assert HVACMode.FAN_ONLY in entity.hvac_modes
+    assert HVACMode.HEAT in entity.hvac_modes

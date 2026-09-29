@@ -51,6 +51,9 @@ class MysaRealtime:
         self._mqtt_listener_task: asyncio.Task[None] | None = None
         self._mqtt_connected = asyncio.Event()
         self._mqtt_ws: Any = None  # ws object from `connect_websocket`
+        # Incremented after every successful MQTT handshake. This lets callers
+        # distinguish fresh telemetry from a previous MQTT connection.
+        self._connection_generation = 0
         self._last_publish_id = 0
         self._pending_publish_ids: set[int] = set()
         self._mqtt_should_reconnect = True
@@ -84,6 +87,11 @@ class MysaRealtime:
     def is_connected(self) -> bool:
         """Return if MQTT is currently connected and authenticated."""
         return bool(self._mqtt_connected.is_set() and self._mqtt_ws is not None)
+
+    @property
+    def connection_generation(self) -> int:
+        """Return the generation of the current successful MQTT session."""
+        return self._connection_generation
 
     async def wait_until_connected(self, timeout: float = 10.0) -> bool:
         """Wait for MQTT connection to be established."""
@@ -213,6 +221,7 @@ class MysaRealtime:
 
         try:
             await self._perform_mqtt_handshake(ws)
+            self._connection_generation += 1
             self._mqtt_connected.set()
             now = time.time()
             self._last_packet_time = now  # Initialize on connect

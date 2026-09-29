@@ -2275,3 +2275,28 @@ class TestMysaApiRecovery:
             # Verify that we now have a NEW user object
             assert api.client._user_obj is not None
             assert api.client._user_obj.id_token == "new_token"
+
+@pytest.mark.asyncio
+async def test_initial_mqtt_refresh_requests_legacy_state_poll():
+    """Legacy devices must receive an immediate state poll after MQTT connects."""
+    api = MysaApi.__new__(MysaApi)
+    api.client = MagicMock()
+    api.client.devices = {
+        "ac1": {
+            "Id": "ac1",
+            "Model": "AC-V1-0",
+        }
+    }
+
+    api.realtime = MagicMock(spec=MysaRealtime)
+    api.realtime.wait_until_connected = AsyncMock(return_value=True)
+
+    api.update_request = AsyncMock()
+    api.async_send_state_poll = AsyncMock()
+    api.fetch_stv10_shadows = AsyncMock()
+
+    await api._wait_and_refresh_mqtt()
+
+    api.update_request.assert_awaited_once_with("ac1")
+    api.async_send_state_poll.assert_awaited_once_with("ac1")
+    api.fetch_stv10_shadows.assert_not_awaited()

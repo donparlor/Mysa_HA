@@ -1386,3 +1386,47 @@ async def test_realtime_send_command_persistent_only_failure():
     with patch.object(realtime, "_send_one_off_command", AsyncMock()) as mock_one_off:
         await realtime.send_command("dev1", {}, "user1", use_persistent_only=True)
         mock_one_off.assert_not_called()
+
+@pytest.mark.asyncio
+async def test_connection_generation_increments_after_successful_reconnect(mock_hass):
+    """MQTT connection generation must change after each successful handshake."""
+    realtime = MysaRealtime(
+        mock_hass,
+        AsyncMock(return_value="https://test.url"),
+        MagicMock(),
+    )
+    realtime.set_devices(["dev1"])
+
+    ws1 = AsyncMock()
+    ws1.close = AsyncMock()
+    ws2 = AsyncMock()
+    ws2.close = AsyncMock()
+
+    with patch(
+        "custom_components.mysa.realtime.connect_websocket",
+        new_callable=AsyncMock,
+    ) as mock_connect:
+        mock_connect.side_effect = [ws1, ws2]
+
+        with (
+            patch.object(
+                realtime,
+                "_perform_mqtt_handshake",
+                new_callable=AsyncMock,
+            ) as mock_handshake,
+            patch.object(
+                realtime,
+                "_run_mqtt_loop",
+                new_callable=AsyncMock,
+            ) as mock_loop,
+        ):
+            assert realtime.connection_generation == 0
+
+            await realtime._mqtt_listen()
+            assert realtime.connection_generation == 1
+
+            await realtime._mqtt_listen()
+            assert realtime.connection_generation == 2
+
+            assert mock_handshake.await_count == 2
+            assert mock_loop.await_count == 2

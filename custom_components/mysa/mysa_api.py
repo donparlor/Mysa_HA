@@ -61,6 +61,10 @@ class MysaApi:
         self._shadow_versions: dict[str, dict[str, int]] = {}
         self._clock_skew: dict[str, float] = {}  # device_id: (mqtt_ts - local_ts)
         self._last_mqtt_poll_time: dict[str, float] = {}  # device_id: timestamp
+        # MQTT connection generation in which each device last supplied a real
+        # HVAC mode. Prevents state from a previous MQTT connection from being
+        # treated as fresh after an automatic reconnect.
+        self._mqtt_hvac_generation: dict[str, int] = {}
 
         # Get websession if not provided
         if websession is None:
@@ -98,6 +102,14 @@ class MysaApi:
     def password(self) -> str:
         """Return password."""
         return self.client.password
+
+    def has_fresh_mqtt_hvac_state(self, device_id: str) -> bool:
+        """Return whether current MQTT session supplied a real HVAC mode."""
+        return bool(
+            self.realtime.is_connected
+            and self._mqtt_hvac_generation.get(device_id)
+            == self.realtime.connection_generation
+        )
 
     @property
     def devices(self) -> dict[str, Any]:
@@ -414,6 +426,17 @@ class MysaApi:
 
         if not MysaDeviceLogic.is_stv10_device(self.devices.get(device_id)):
             MysaDeviceLogic.normalize_state(state_update)
+
+        # A real MQTT HVAC mode proves that the mode is fresh for the current
+        # MQTT connection. Protocol echoes such as MsgType 11 contain no
+        # md/mode and therefore do not qualify.
+        if (
+            not MysaDeviceLogic.is_stv10_device(self.devices.get(device_id))
+            and any(key in state_update for key in ("md", "mode"))
+        ):
+            self._mqtt_hvac_generation[device_id] = (
+                self.realtime.connection_generation
+            )
 
         # Trust MQTT updates - they're real-time from the device
         # (HTTP polls use filter_stale=True in get_state to avoid cloud lag)
@@ -1991,6 +2014,7 @@ class MysaApi:
                 tasks.append(self.fetch_stv10_shadows(device_id))
             else:
                 tasks.append(self.update_request(device_id))
+                tasks.append(self.async_send_state_poll(device_id))
 
         if tasks:
             await asyncio.gather(*tasks)

@@ -138,3 +138,62 @@ async def test_mqtt_updates_ha_states(
         assert float(hass.states.get(temperature).state) == 19.0
         assert float(hass.states.get(humidity).state) == 40.0
         assert await hass.config_entries.async_unload(mock_config_entry.entry_id)
+
+async def test_ac_v1_mqtt_hvac_freshness_resets_on_reconnect(hass):
+    """AC-V1 HVAC freshness must belong to the current MQTT connection."""
+    device_id = "ac_device"
+
+    api = MysaApi(
+        "test@example.com",
+        "password",
+        hass,
+        websession=async_get_clientsession(hass),
+    )
+    api.devices = {
+        device_id: {
+            "Id": device_id,
+            "Name": "Test AC",
+            "Model": "AC-V1-0",
+        }
+    }
+
+    # Avoid the metadata-nudge side effect in _on_mqtt_update().
+    api.states[device_id] = {
+        "FirmwareVersion": "1.0",
+        "ip": "192.0.2.1",
+        "ACMode": 4,
+        "Mode": 4,
+    }
+
+    # First successful MQTT connection.
+    api.realtime._connection_generation = 1
+    api.realtime._mqtt_ws = object()
+    api.realtime._mqtt_connected.set()
+
+    assert api.has_fresh_mqtt_hvac_state(device_id) is False
+
+    await api._on_mqtt_update(device_id, {"md": 6})
+    assert api.has_fresh_mqtt_hvac_state(device_id) is True
+    assert api._mqtt_hvac_generation[device_id] == 1
+
+    # Connection drops: old telemetry must immediately stop being authoritative.
+    api.realtime._mqtt_connected.clear()
+    api.realtime._mqtt_ws = None
+    assert api.has_fresh_mqtt_hvac_state(device_id) is False
+
+    # Automatic reconnect creates a new MQTT generation.
+    api.realtime._connection_generation = 2
+    api.realtime._mqtt_ws = object()
+    api.realtime._mqtt_connected.set()
+
+    # The generation-1 HVAC state is stale in generation 2.
+    assert api.has_fresh_mqtt_hvac_state(device_id) is False
+
+    # A protocol-only MQTT echo must not mark HVAC state fresh.
+    await api._on_mqtt_update(device_id, {"Timestamp": int(time.time())})
+    assert api.has_fresh_mqtt_hvac_state(device_id) is False
+
+    # A real HVAC mode from generation 2 establishes freshness again.
+    await api._on_mqtt_update(device_id, {"md": 1})
+    assert api.has_fresh_mqtt_hvac_state(device_id) is True
+    assert api._mqtt_hvac_generation[device_id] == 2
